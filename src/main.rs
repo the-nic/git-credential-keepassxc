@@ -856,36 +856,74 @@ fn generate_password<T: AsRef<Path>>(
     Ok(())
 }
 
-fn edit<T: AsRef<Path>>(config_path: T) -> Result<()> {
-    const KNOWN_EDITORS: &[&str] = &["nvim", "vim", "kak", "vi", "nano", "ex"];
-    let find_editor = || -> Option<String> {
-        if let Ok(editor) = env::var("VISUAL") {
-            debug!("Found editor {} via VISUAL environment variable", editor);
-            return Some(editor);
-        } else if let Ok(editor) = env::var("EDITOR") {
-            debug!("Found editor {} via EDITOR environment variable", editor);
-            return Some(editor);
-        } else {
-            for editor in KNOWN_EDITORS {
-                if which::which(editor).is_ok() {
-                    debug!("Found known editor {}", editor);
-                    return Some(editor.to_string());
-                }
-            }
-        }
+/// Splits an editor command, e.g. from `$EDITOR`, into a program and its arguments.
+///
+/// The whole string is tried as a program first so that paths containing spaces keep working
+/// (e.g. `C:\Program Files\Editor\editor.exe`). Otherwise it is split on whitespace to support
+/// values like `code -w`.
+fn parse_editor(
+    editor: &str,
+    is_available: &impl Fn(&str) -> bool,
+) -> Option<(String, Vec<String>)> {
+    let editor = editor.trim();
+    if editor.is_empty() {
+        return None;
+    }
+    if is_available(editor) {
+        return Some((editor.to_string(), Vec::new()));
+    }
+    let mut parts = editor.split_whitespace();
+    let program = parts.next()?;
+    if is_available(program) {
+        Some((program.to_string(), parts.map(String::from).collect()))
+    } else {
         None
-    };
+    }
+}
 
-    if let Some(editor) = find_editor() {
+fn find_editor(
+    get_env: impl Fn(&str) -> Option<String>,
+    is_available: impl Fn(&str) -> bool,
+) -> Option<(String, Vec<String>)> {
+    const KNOWN_EDITORS: &[&str] = &["nvim", "vim", "kak", "vi", "nano", "ex"];
+    for var in ["VISUAL", "EDITOR"] {
+        if let Some(editor) = get_env(var) {
+            if let Some(parsed) = parse_editor(&editor, &is_available) {
+                debug!("Found editor {} via {} environment variable", editor, var);
+                return Some(parsed);
+            }
+            warn!(
+                "Editor '{}' from {} environment variable was not found in PATH",
+                editor, var
+            );
+        }
+    }
+    for editor in KNOWN_EDITORS {
+        if is_available(editor) {
+            debug!("Found known editor {}", editor);
+            return Some((editor.to_string(), Vec::new()));
+        }
+    }
+    None
+}
+
+fn edit<T: AsRef<Path>>(config_path: T) -> Result<()> {
+    let editor = find_editor(
+        |var| env::var(var).ok(),
+        |program| which::which(program).is_ok(),
+    );
+
+    if let Some((program, args)) = editor {
         println!(
             "Opening {} using {}",
             config_path.as_ref().to_string_lossy(),
-            editor
+            program
         );
-        let mut editor_process = Command::new(editor)
+        let mut editor_process = Command::new(&program)
+            .args(&args)
             .arg(config_path.as_ref())
             .spawn()
-            .map_err(|e| anyhow!("Failed to open editor: {}", e))?;
+            .map_err(|e| anyhow!("Failed to open editor '{}': {}", program, e))?;
         println!("Waiting user to finish...");
         editor_process.wait()?;
     } else {
@@ -1025,6 +1063,84 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    fn available_of<'a>(programs: &'a [&'a str]) -> impl Fn(&str) -> bool + 'a {
+        move |program| programs.contains(&program)
+    }
+
+    fn editor(program: &str, args: &[&str]) -> Option<(String, Vec<String>)> {
+        Some((
+            program.to_string(),
+            args.iter().map(|arg| arg.to_string()).collect(),
+        ))
+    }
+
+    #[test]
+    fn test_07_find_editor_uses_visual_when_available() {
+        let result = find_editor(
+            env_of(&[("VISUAL", "code -w"), ("EDITOR", "vim")]),
+            available_of(&["code", "vim"]),
+        );
+        assert_eq!(result, editor("code", &["-w"]));
+    }
+
+    #[test]
+    fn test_08_find_editor_falls_back_to_editor_when_visual_missing() {
+        let result = find_editor(
+            env_of(&[("VISUAL", "nano"), ("EDITOR", "vim")]),
+            available_of(&["vim"]),
+        );
+        assert_eq!(result, editor("vim", &[]));
+    }
+
+    #[test]
+    fn test_09_find_editor_falls_back_to_known_editors_when_env_missing() {
+        let result = find_editor(
+            env_of(&[("VISUAL", "nano"), ("EDITOR", "nano")]),
+            available_of(&["vi"]),
+        );
+        assert_eq!(result, editor("vi", &[]));
+    }
+
+    #[test]
+    fn test_10_find_editor_none_when_nothing_available() {
+        let result = find_editor(env_of(&[("EDITOR", "nano")]), available_of(&[]));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_11_find_editor_keeps_program_path_with_spaces() {
+        let path = "/opt/my editor/bin/ed";
+        let result = find_editor(env_of(&[("EDITOR", path)]), available_of(&[path]));
+        assert_eq!(result, editor(path, &[]));
+    }
+
+    #[test]
+    fn test_12_find_editor_splits_multiple_arguments() {
+        let result = find_editor(
+            env_of(&[("EDITOR", "emacsclient  -c   -a emacs")]),
+            available_of(&["emacsclient"]),
+        );
+        assert_eq!(result, editor("emacsclient", &["-c", "-a", "emacs"]));
+    }
+
+    #[test]
+    fn test_13_find_editor_ignores_blank_env() {
+        let result = find_editor(
+            env_of(&[("VISUAL", "  "), ("EDITOR", "")]),
+            available_of(&["vi"]),
+        );
+        assert_eq!(result, editor("vi", &[]));
+    }
 
     #[test]
     #[cfg(feature = "strict-caller")]
