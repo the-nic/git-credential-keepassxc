@@ -330,7 +330,7 @@ fn caller<T: AsRef<Path>>(config_path: T, args: &cli::SubCallerArgs) -> Result<(
                 let caller = Caller::from_current_caller(
                     &current_caller,
                     caller_me_args.no_uid,
-                    caller_me_args.no_uid,
+                    caller_me_args.no_gid,
                     caller_me_args.canonicalize,
                     !caller_me_args.no_notify,
                 );
